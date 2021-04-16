@@ -37,7 +37,7 @@ def parse_args():
                         help='Input data path.')
     parser.add_argument('--dataset', nargs='?', default='criteo',
                         help='Choose a dataset.')
-    parser.add_argument('--epoch', type=int, default=30,
+    parser.add_argument('--epoch', type=int, default=500,
                         help='Number of epochs.')
     parser.add_argument('--pretrain', type=int, default=0,
                         help='Pre-train flag. 0: train from scratch; 1: load from pretrain file')
@@ -51,7 +51,7 @@ def parse_args():
                         help='Keep probability (i.e., 1-dropout_ratio) for each deep layer and the Bi-Interaction layer. 1: no dropout. Note that the last index is for the Bi-Interaction layer.')
     parser.add_argument('--lamda', type=float, default=0,
                         help='Regularizer for bilinear part.')
-    parser.add_argument('--lr', type=float, default=0.01,
+    parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate.')
     parser.add_argument('--loss_type', nargs='?', default='square_loss',
                         help='Specify a loss type (square_loss or log_loss).')
@@ -76,16 +76,6 @@ def parse_args():
 def load_data():
     dfTrain = pd.read_csv(config.TRAIN_FILE)
     dfTest = pd.read_csv(config.TEST_FILE)
-
-    def preprocess(df):
-        # cols = [c for c in df.columns if c not in ['id','target']]
-        # #df['missing_feat'] = np.sum(df[df[cols]==-1].values,axis=1)
-        # df["missing_feat"] = np.sum((df[cols] == -1).values, axis=1)
-        # df['ps_car_13_x_ps_reg_03'] = df['ps_car_13'] * df['ps_reg_03']
-        return df
-
-    dfTrain = preprocess(dfTrain)
-    dfTest = preprocess(dfTest)
 
     cols = [c for c in dfTrain.columns if c not in ['Id','Label']]
     cols = [c for c in cols if (not c in config.IGNORE_COLS)]
@@ -174,9 +164,9 @@ class NeuralFM(BaseEstimator, TransformerMixin):
             self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)  # None * K
 
             # _________ attention part _____________
-            num_interactions = self.valid_dimension * (self.valid_dimension - 1) / 2
+            num_interactions = self.field_size * (self.field_size - 1) / 2
             if self.attention:
-                self.attention_mul = tf.reshape(tf.matmul(tf.reshape(self.squared_features_emb, shape=[-1, self.layers[0]]), \
+                self.attention_mul = tf.reshape(tf.matmul(tf.reshape(self.squared_features_emb, shape=[-1,self.layers[0]]), \
                     self.weights['attention_W']), shape=[-1, int(num_interactions), self.layers[0]])
                 self.attention_relu = tf.reduce_sum(tf.multiply(self.weights['attention_p'], tf.nn.relu(self.attention_mul + \
                     self.weights['attention_b'])), 2, keep_dims=True)
@@ -190,7 +180,7 @@ class NeuralFM(BaseEstimator, TransformerMixin):
 
             # ________ FM __________
             self.FM = 0.5 * tf.subtract(self.summed_features_emb_square, self.squared_sum_features_emb)  # None * K
-            self.FM = tf.nn.dropout(self.FM, self.dropout_keep[-1]) # dropout at the bilinear interactin layer
+            self.FM = tf.nn.dropout(self.FM, self.dropout_keep[1]) # dropout at the bilinear interactin layer
 
             # ________ Deep Layers __________
             self.deep = tf.reshape(nonzero_embeddings, shape=[-1,self.field_size * self.hidden_factor])
@@ -200,15 +190,18 @@ class NeuralFM(BaseEstimator, TransformerMixin):
                 if self.batch_norm:
                     self.deep = self.batch_norm_layer(self.deep, train_phase=self.train_phase, scope_bn='bn_%d' %i) # None * layer[i] * 1
                 self.deep = self.activation_function(self.deep)
-                self.deep = tf.nn.dropout(self.deep, self.dropout_keep[i]) # dropout at each Deep layer
+                self.deep = tf.nn.dropout(self.deep, self.dropout_keep[i+1]) # dropout at each Deep layer
 
             # _________DeepFM_________
-            self.concat = tf.concat([self.y_first_order, self.FM, self.deep], axis=1)
+            if self.attention:
+                self.concat = tf.concat([self.y_first_order, self.AFM, self.deep], axis=1)
+            else:
+                self.concat = tf.concat([self.y_first_order, self.FM, self.deep], axis=1)
             self.out = tf.add(tf.matmul(self.concat, self.weights["prediction"]), self.weights["bias"])
 
             # Compute the loss.
             if self.loss_type == 'square_loss':
-                self.out = tf.sigmoid(self.out)
+                self.out = tf.nn.sigmoid(self.out)
                 if self.lamda_bilinear > 0:
                     self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(self.lamda_bilinear)(self.weights['feature_embeddings'])  # regulizer
                 else:
@@ -334,45 +327,33 @@ class NeuralFM(BaseEstimator, TransformerMixin):
               Xi_test, Xv_test, y_test):  # fit a dataset
         # Check Init performance
         a,b,c =[],[],[]
-        # if self.verbose > 0:
-        #     t2 = time()
-        #     init_train = self.evaluate(Train_data)
-        #     init_valid = self.evaluate(Validation_data)
-        #     init_test = self.evaluate(Test_data)
-        #     print('init,train_loss:',init_train, 'validation_loss:',init_valid, 'test_loss:',init_test)
-        #
-        # os.remove('./results'+str(self.attention)+'.txt')
-        # fi = open('./results'+str(self.attention)+'.txt', 'a')
         for epoch in range(self.epoch):
             t1 = time()
             self.shuffle_in_unison_scary(Xi_train, Xv_train, y_train)
+            self.shuffle_in_unison_scary(Xi_test, Xv_test, y_test)
             total_batch = int(len(y_train) / self.batch_size)
             # c.append(epoch)
             for i in range(total_batch):
                 # generate a batch
                 Xi_batch, Xv_batch, y_batch = self.get_batch(Xi_train, Xv_train, y_train, self.batch_size, i)
-                #batch_xs = self.get_random_block_from_data(Train_data, self.batch_size)
                 # Fit training
                 self.partial_fit(Xi_batch, Xv_batch, y_batch)
-            t2 = time()
 
             # output validation
             train_result = self.evaluate(Xi_train, Xv_train, y_train)
             valid_result = self.evaluate(Xi_valid, Xv_valid, y_valid)
             test_result  = self.evaluate(Xi_test, Xv_test, y_test)
-
             # a.append(test_result[0])
             # b.append(test_result[1])
             self.train_rmse.append(train_result)
             self.valid_rmse.append(valid_result)
             self.test_rmse.append(test_result)
             if self.verbose > 0 and epoch%self.verbose == 0:
-            # print('epoch:',epoch+1, 'train_loss:', train_result, 'validation_loss:',valid_result, 'test_loss:',test_result,file=fi)
                 print('epoch:', epoch + 1, 'train_loss:', train_result, 'validation_loss:', valid_result, 'test_loss:',
-                      test_result)
+                      test_result,'time:',time()-t1)
 
             if self.early_stop > 0 and self.eva_termination(self.valid_rmse):
-                #print "Early stop at %d based on validation result." %(epoch+1)
+                print ("Early stop at %d based on validation result."%(epoch+1))
                 break
         # fi.close()
         # plt.title("RMSE")
@@ -405,7 +386,7 @@ class NeuralFM(BaseEstimator, TransformerMixin):
         y_true = np.array(y)
         while len(Xi_batch) >0:
             num_batch = len(y_batch)
-            feed_dict = {self.feat_index: Xi_batch, self.feat_value: Xv_batch, self.train_labels: y_batch, self.dropout_keep: self.no_dropout, self.train_phase: False}
+            feed_dict = {self.feat_index: Xi_batch, self.feat_value: Xv_batch, self.train_labels: y_batch, self.dropout_keep: self.keep_prob, self.train_phase: False}
             predictions = self.sess.run(self.out, feed_dict=feed_dict)
 
             if batch_index == 0:
@@ -414,7 +395,6 @@ class NeuralFM(BaseEstimator, TransformerMixin):
                 y_pred = np.concatenate((y_pred, np.reshape(predictions, (num_batch,))))
             batch_index += 1
             Xi_batch, Xv_batch, y_batch = self.get_batch(Xi, Xv, dummy_y, self.batch_size, batch_index)
-
 
         if self.loss_type == 'square_loss':
             predictions_bounded = np.maximum(y_pred, np.ones(len(y)) * min(y_true))  # bound the lower values
@@ -472,13 +452,9 @@ if __name__ == '__main__':
                          feature_size, field_size)
 
     # Training
-    t1 = time()
     for i, (train_idx, valid_idx) in enumerate(folds):
         Xi_train_, Xv_train_, y_train_ = _get(Xi_train, train_idx), _get(Xv_train, train_idx), _get(y_train, train_idx)
         Xi_valid_, Xv_valid_, y_valid_ = _get(Xi_train, valid_idx), _get(Xv_train, valid_idx), _get(y_train, valid_idx)
-
-
-
         model.train(Xi_train_,Xv_train_,y_train_,Xi_valid_,Xv_valid_,y_valid_,Xi_test,Xv_test,y_test)
     # model.train(data.Train_data, data.Validation_data, data.Test_data)
     # Find the best validation result across iterations
