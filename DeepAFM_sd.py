@@ -56,7 +56,7 @@ def parse_args():
                         help='Learning rate.')
     parser.add_argument('--loss_type', nargs='?', default='square_loss',
                         help='Specify a loss type (square_loss or log_loss).')
-    parser.add_argument('--optimizer', nargs='?', default='MomentumOptimizer',
+    parser.add_argument('--optimizer', nargs='?', default='GradientDescentOptimizerg',
                         help='Specify an optimizer type (AdamOptimizer, AdagradOptimizer, GradientDescentOptimizer, MomentumOptimizer).')
     parser.add_argument('--verbose', type=int, default=1,
                         help='Show the results per X epochs (0, 1 ... any positive integer)')
