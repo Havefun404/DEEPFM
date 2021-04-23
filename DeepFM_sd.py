@@ -37,23 +37,23 @@ def parse_args():
                         help='Input data path.')
     parser.add_argument('--dataset', nargs='?', default='criteo',
                         help='Choose a dataset.')
-    parser.add_argument('--epoch', type=int, default=50,
+    parser.add_argument('--epoch', type=int, default=100,
                         help='Number of epochs.')
     parser.add_argument('--pretrain', type=int, default=0,
                         help='Pre-train flag. 0: train from scratch; 1: load from pretrain file')
     parser.add_argument('--batch_size', type=int, default=128,
                         help='Batch size.')
-    parser.add_argument('--hidden_factor', type=int, default=8,
+    parser.add_argument('--hidden_factor', type=int, default=16,
                         help='Number of hidden factors.')
-    parser.add_argument('--layers', nargs='?', default='[400,400]',
+    parser.add_argument('--layers', nargs='?', default='[100,100,100]',
                         help="Size of each layer.")
-    parser.add_argument('--keep_prob', nargs='?', default='[0.8,0.8,0.5]',
+    parser.add_argument('--keep_prob', nargs='?', default='[0.8,0.8,0.8,0.5]',
                         help='Keep probability (i.e., 1-dropout_ratio) for each deep layer and the Bi-Interaction layer. 1: no dropout. Note that the last index is for the Bi-Interaction layer.')
-    parser.add_argument('--lamda', type=float, default=0.0001,
+    parser.add_argument('--lamda', type=float, default=1e+2,
                         help='Regularizer for bilinear part.')
     parser.add_argument('--lr', type=float, default=0.0001,
                         help='Learning rate.')
-    parser.add_argument('--loss_type', nargs='?', default='log_loss',
+    parser.add_argument('--loss_type', nargs='?', default='square_loss',
                         help='Specify a loss type (square_loss or log_loss).')
     parser.add_argument('--optimizer', nargs='?', default='MomentumOptimizer',
                         help='Specify an optimizer type (AdamOptimizer, AdagradOptimizer, GradientDescentOptimizer, MomentumOptimizer).')
@@ -145,7 +145,7 @@ class NeuralFM(BaseEstimator, TransformerMixin):
             # Variables.
             self.weights = self._initialize_weights()
             nonzero_embeddings = tf.nn.embedding_lookup(self.weights['feature_embeddings'], self.feat_index)
-            feat_value = tf.reshape(self.feat_value,shape=[-1,self.field_size,1])
+            feat_value = tf.reshape(self.feat_value,shape=[-1, self.field_size,1])
             nonzero_embeddings = tf.multiply(nonzero_embeddings,feat_value)
             # ---------- first order term ----------
             self.y_first_order = tf.nn.embedding_lookup(self.weights["feature_bias"], self.feat_index)
@@ -229,7 +229,9 @@ class NeuralFM(BaseEstimator, TransformerMixin):
             if self.loss_type == 'square_loss':
                 self.out = tf.nn.sigmoid(self.out)
                 if self.lamda_bilinear > 0:
-                    self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(self.lamda_bilinear)(self.weights['feature_embeddings'])  # regulizer
+                    # self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(self.lamda_bilinear)(self.weights['attention_W'])  # regulizer
+                    self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(self.lamda_bilinear)(self.weights['prediction'])
+                    self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(self.lamda_bilinear)(self.weights['feature_embeddings'])
                     for i in range(len(self.layers)):
                         self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out))+tf.contrib.layers.l2_regularizer(self.lamda_bilinear)(self.weights['layer_%d' %i])
                 else:
@@ -349,7 +351,7 @@ class NeuralFM(BaseEstimator, TransformerMixin):
         for epoch in range(self.epoch):
             t1 = time()
             self.shuffle_in_unison_scary(Xi_train, Xv_train, y_train)
-            self.shuffle_in_unison_scary(Xi_test, Xv_test, y_test)
+            # self.shuffle_in_unison_scary(Xi_test, Xv_test, y_test)
             total_batch = int(len(y_train) / self.batch_size)
             # c.append(epoch)
             for i in range(total_batch):
