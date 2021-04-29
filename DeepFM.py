@@ -22,32 +22,33 @@ from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
 from time import time
 import argparse
-import LoadData as DATA
+import LoadData_v2 as DATA
 from tensorflow.contrib.layers.python.layers import batch_norm as batch_norm
 import matplotlib.pyplot as plt
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 #################### Arguments ####################
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Neural FM.")
     parser.add_argument('--path', nargs='?', default='./data/',
                         help='Input data path.')
-    parser.add_argument('--dataset', nargs='?', default='ml-tag',
+    parser.add_argument('--dataset', nargs='?', default='company',
                         help='Choose a dataset.')
-    parser.add_argument('--epoch', type=int, default=100,
+    parser.add_argument('--epoch', type=int, default=50,
                         help='Number of epochs.')
     parser.add_argument('--pretrain', type=int, default=0,
                         help='Pre-train flag. 0: train from scratch; 1: load from pretrain file')
     parser.add_argument('--batch_size', type=int, default=128,
                         help='Batch size.')
-    parser.add_argument('--hidden_factor', type=int, default=64,
+    parser.add_argument('--hidden_factor', type=int, default=8,
                         help='Number of hidden factors.')
-    parser.add_argument('--layers', nargs='?', default='[64]',
+    parser.add_argument('--layers', nargs='?', default='[64,64]',
                         help="Size of each layer.")
-    parser.add_argument('--keep_prob', nargs='?', default='[0.8,0.5]',
+    parser.add_argument('--keep_prob', nargs='?', default='[0.8,0.8,0.5]',
                         help='Keep probability (i.e., 1-dropout_ratio) for each deep layer and the Bi-Interaction layer. 1: no dropout. Note that the last index is for the Bi-Interaction layer.')
-    parser.add_argument('--lamda', type=float, default=0,
+    parser.add_argument('--lamda', type=float, default=0.0001,
                         help='Regularizer for bilinear part.')
-    parser.add_argument('--lr', type=float, default=0.05,
+    parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate.')
     parser.add_argument('--loss_type', nargs='?', default='square_loss',
                         help='Specify a loss type (square_loss or log_loss).')
@@ -62,7 +63,7 @@ def parse_args():
     parser.add_argument('--early_stop', type=int, default=1,
                     help='Whether to perform early stop (0 or 1)')
     # #valid_dimen是lib文件中字段的个数
-    parser.add_argument('--valid_dimension', type=int, default=3,
+    parser.add_argument('--valid_dimension', type=int, default=36,
                          help='Valid dimension of the dataset. (e.g. frappe=10, ml-tag=3)')
     # #define attention
     parser.add_argument('--attention', type=int, default=1,
@@ -120,6 +121,7 @@ class NeuralFM(BaseEstimator, TransformerMixin):
             # ---------- first order term ----------
             self.y_first_order = tf.nn.embedding_lookup(self.weights["feature_bias"], self.train_features)
             self.y_first_order = tf.reduce_sum(self.y_first_order, 1)
+            # self.y_first_order = tf.reshape(self.y_first_order, shape=[-1, self.valid_dimension])
             self.y_first_order = tf.nn.dropout(self.y_first_order, self.dropout_keep[0])
 
             # Model.
@@ -134,27 +136,39 @@ class NeuralFM(BaseEstimator, TransformerMixin):
             self.squared_features_emb = tf.square(nonzero_embeddings)
             self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)  # None * K
 
+            if self.attention:
+                element_wise_product_list = []
+                for i in range(self.valid_dimension):
+                    for j in range(i + 1, self.valid_dimension):
+                        element_wise_product_list.append(
+                            tf.multiply(nonzero_embeddings[:, i, :], nonzero_embeddings[:, j, :]))
+                self.element_wise_product = tf.stack(element_wise_product_list)
+                self.element_wise_product = tf.transpose(self.element_wise_product, perm=[1, 0, 2],
+                                                         name='element_wise_product')
+
             # _________ attention part _____________
             num_interactions = self.valid_dimension * (self.valid_dimension - 1) / 2
             if self.attention:
-                self.attention_mul = tf.reshape(tf.matmul(tf.reshape(self.squared_features_emb, shape=[-1, self.layers[0]]), \
-                    self.weights['attention_W']), shape=[-1, int(num_interactions), self.layers[0]])
-                self.attention_relu = tf.reduce_sum(tf.multiply(self.weights['attention_p'], tf.nn.relu(self.attention_mul + \
-                    self.weights['attention_b'])), 2, keep_dims=True)
+                self.attention_mul = tf.reshape(tf.matmul(tf.reshape(self.element_wise_product, shape=[-1, self.hidden_factor]), \
+                    self.weights['attention_W']), shape=[-1, int(num_interactions), 10])
+                self.attention_relu = tf.reduce_sum(tf.multiply(tf.nn.relu(self.attention_mul + \
+                    self.weights['attention_b']),self.weights['attention_h']), 2, keep_dims=True)
                 self.attention_out = tf.nn.softmax(self.attention_relu)
-                self.attention_out = tf.nn.dropout(self.attention_out, self.dropout_keep[0])
+                self.attention_out = tf.multiply(tf.transpose(self.weights['attention_p']), self.attention_out)
+                self.attention_out = tf.nn.dropout(self.attention_out, self.dropout_keep[-1])
 
             # _________ Attention-aware Pairwise Interaction Layer _____________
             if self.attention:
-                self.AFM = tf.reduce_sum(tf.multiply(self.attention_out,self.squared_features_emb), 1, name="afm")
-                self.AFM = tf.nn.dropout(self.AFM, self.dropout_keep[1])
+                self.AFM = tf.reduce_sum(tf.multiply(self.attention_out,self.element_wise_product), 1, name="afm")
+                self.AFM = tf.nn.dropout(self.AFM, self.dropout_keep[-1])
 
             # ________ FM __________
             self.FM = 0.5 * tf.subtract(self.summed_features_emb_square, self.squared_sum_features_emb)  # None * K
             self.FM = tf.nn.dropout(self.FM, self.dropout_keep[-1]) # dropout at the bilinear interactin layer
 
             # ________ Deep Layers __________
-            self.deep = tf.reduce_sum(nonzero_embeddings, 1)
+            # self.deep = tf.reduce_sum(nonzero_embeddings, 1)
+            self.deep = tf.reshape(nonzero_embeddings,shape=[-1,self.valid_dimension*self.hidden_factor])
             self.deep = tf.nn.dropout(self.deep, self.dropout_keep[0])
             for i in range(len(self.layers)):
                 self.deep = tf.add(tf.matmul(self.deep, self.weights['layer_%d' %i]), self.weights['bias_%d'%i]) # None * layer[i] * 1
@@ -164,11 +178,16 @@ class NeuralFM(BaseEstimator, TransformerMixin):
                 self.deep = tf.nn.dropout(self.deep, self.dropout_keep[i]) # dropout at each Deep layer
 
             # _________DeepFM_________
-            self.concat = tf.concat([self.y_first_order, self.AFM, self.deep], axis=1)
-            self.out = tf.add(tf.matmul(self.concat, self.weights["prediction"]), self.weights["bias"])
+            if self.attention:
+                self.concat = tf.concat([self.y_first_order, self.AFM, self.deep], axis=1)
+                self.out = tf.add(tf.matmul(self.concat, self.weights["prediction"]), self.weights["bias"])
+            else:
+                self.concat = tf.concat([self.y_first_order, self.FM, self.deep], axis=1)
+                self.out = tf.add(tf.matmul(self.concat, self.weights["prediction"]), self.weights["bias"])
 
             # Compute the loss.
             if self.loss_type == 'square_loss':
+                self.out = tf.sigmoid(self.out)
                 if self.lamda_bilinear > 0:
                     self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(self.lamda_bilinear)(self.weights['feature_embeddings'])  # regulizer
                 else:
@@ -225,24 +244,27 @@ class NeuralFM(BaseEstimator, TransformerMixin):
         else: # without pretrain
             all_weights['feature_embeddings'] = tf.Variable(
                 tf.random_normal([self.features_M, self.hidden_factor], 0.0, 0.01), name='feature_embeddings')  # features_M * K
-            all_weights['feature_bias'] = tf.Variable(tf.random_uniform([self.features_M, 1], 0.0, 0.0), name='feature_bias')  # features_M * 1
-            all_weights['bias'] = tf.Variable(tf.constant(0.0), name='bias')  # 1 * 1
+            all_weights['feature_bias'] = tf.Variable(tf.random_uniform([self.features_M, 1], 0.0, 1.0), name='feature_bias')  # features_M * 1
+            all_weights['bias'] = tf.Variable(tf.constant(0.01), dtype=np.float32,name='bias')  # 1 * 1
 
         # attention
         if self.attention:
-            glorot = np.sqrt(2.0 / (self.hidden_factor + self.layers[0]))
+            glorot = np.sqrt(2.0 / (10 + self.hidden_factor))
             all_weights['attention_W'] = tf.Variable(
-                np.random.normal(loc=0, scale=glorot, size=(self.hidden_factor, self.layers[0])), dtype=np.float32, name="attention_W")
+                np.random.normal(loc=0, scale=glorot, size=(self.hidden_factor,10)), dtype=np.float32, name="attention_W")
             all_weights['attention_b'] = tf.Variable(
-                np.random.normal(loc=0, scale=glorot, size=(1,self.layers[0])), dtype=np.float32, name="attention_b")
+                np.random.normal(loc=0, scale=glorot, size=(1, 10)), dtype=np.float32, name="attention_b")
             all_weights['attention_p'] = tf.Variable(
-                np.random.normal(loc=0, scale=1, size=(self.layers[0])), dtype=np.float32, name="attention_p")
+                np.random.normal(loc=0, scale=1, size=(self.hidden_factor)), dtype=np.float32, name="attention_p")
+            all_weights['attention_h'] = tf.Variable(
+                np.random.normal(loc=0, scale=1, size=(10,)), dtype=tf.float32, name='attention_h')
 
         # deep layers
         num_layer = len(self.layers)
+        input_size = self.hidden_factor * self.valid_dimension
         if num_layer > 0:
             glorot = np.sqrt(2.0 / (self.hidden_factor + self.layers[0]))
-            all_weights['layer_0'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(self.hidden_factor, self.layers[0])), dtype=np.float32)
+            all_weights['layer_0'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(input_size, self.layers[0])), dtype=np.float32)
             all_weights['bias_0'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(1, self.layers[0])), dtype=np.float32)  # 1 * layers[0]
             for i in range(1, num_layer):
                 glorot = np.sqrt(2.0 / (self.layers[i-1] + self.layers[i]))
@@ -251,8 +273,9 @@ class NeuralFM(BaseEstimator, TransformerMixin):
                 all_weights['bias_%d' %i] = tf.Variable(
                     np.random.normal(loc=0, scale=glorot, size=(1, self.layers[i])), dtype=np.float32)  # 1 * layer[i]
 	        # prediction layer
-            glorot = np.sqrt(2.0 / (self.layers[-1] + 1))
-            all_weights['prediction'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(self.hidden_factor*2+1, 1)), dtype=np.float32)  # layers[-1] * 1
+            in_size =  self.hidden_factor + self.layers[0]
+            glorot = np.sqrt(2.0 / (in_size + 1))
+            all_weights['prediction'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(in_size+1, 1)), dtype=np.float32)  # layers[-1] * 1
         else:
             all_weights['prediction'] = tf.Variable(np.ones((self.hidden_factor*2+1, 1), dtype=np.float32))  # hidden_factor * 1
         return all_weights
@@ -327,15 +350,15 @@ class NeuralFM(BaseEstimator, TransformerMixin):
             train_result = self.evaluate(Train_data)
             valid_result = self.evaluate(Validation_data)
             test_result = self.evaluate(Test_data)
-            a.append(test_result[0])
-            b.append(test_result[1])
+            a.append(valid_result[0])
+            b.append(valid_result[1])
             self.train_rmse.append(train_result)
             self.valid_rmse.append(valid_result)
             self.test_rmse.append(test_result)
             if self.verbose > 0 and epoch%self.verbose == 0:
                 # print('epoch:',epoch+1, 'train_loss:', train_result, 'validation_loss:',valid_result, 'test_loss:',test_result,file=fi)
                 print('epoch:', epoch + 1, 'train_loss:', train_result, 'validation_loss:', valid_result, 'test_loss:',
-                      test_result)
+                      test_result, 'time', time()-t1)
 
             if self.early_stop > 0 and self.eva_termination(self.valid_rmse):
                 #print "Early stop at %d based on validation result." %(epoch+1)
@@ -366,7 +389,7 @@ class NeuralFM(BaseEstimator, TransformerMixin):
     def evaluate(self, data):  # evaluate the results for an input set
         num_example = len(data['Y'])
         feed_dict = {self.train_features: data['X'], self.train_labels: [[y] for y in data['Y']], self.dropout_keep: self.no_dropout, self.train_phase: False}
-        predictions = self.sess.run((self.out), feed_dict=feed_dict)
+        predictions = self.sess.run(self.out, feed_dict=feed_dict)
         y_pred = np.reshape(predictions, (num_example,))
         y_true = np.reshape(data['Y'], (num_example,))
 
@@ -375,7 +398,7 @@ class NeuralFM(BaseEstimator, TransformerMixin):
             predictions_bounded = np.minimum(predictions_bounded, np.ones(num_example) * max(y_true))  # bound the higher values
             RMSE = math.sqrt(mean_squared_error(y_true, predictions_bounded))
             auc = roc_auc_score(y_true, y_pred)
-            return [RMSE,auc]
+            return [RMSE, auc]
         elif self.loss_type == 'log_loss':
             logloss = log_loss(y_true, y_pred) # I haven't checked the log_loss
             auc = roc_auc_score(y_true, y_pred)
@@ -385,20 +408,6 @@ if __name__ == '__main__':
     # Data loading
     args = parse_args()
     data = DATA.LoadData(args.path, args.dataset, args.loss_type)
-
-
-    # for item in data.features.items():
-    #     for i in range(len(item)):
-    #         str1 = item[i]
-    #         with open(r'Train_data.txt', 'a') as f:
-    #             f.write(str(str1))
-    #             f.write('\r\t')
-    # for item in data.Train_data.items():
-    #     for i in range(len(item)):
-    #         str1 = item[i]
-    #         with open(r'Train_data.txt', 'a') as f:
-    #             f.write(str(str1))
-    #             f.write('\r\t')
 
     if args.verbose > 0:
         print("Neural FM: dataset=%s, attention=%s, valid_dimension=%s, hidden_factor=%d, dropout_keep=%s, layers=%s, loss_type=%s, pretrain=%d, #epoch=%d, batch=%d, lr=%.4f, lambda=%.4f, optimizer=%s, batch_norm=%d, activation=%s, early_stop=%d"
@@ -414,7 +423,19 @@ if __name__ == '__main__':
     # Training
     t1 = time()
     model = NeuralFM(data.features_M, args.attention, args.valid_dimension, args.hidden_factor, eval(args.layers), args.loss_type, args.pretrain, args.epoch, args.batch_size, args.lr, args.lamda, eval(args.keep_prob), args.optimizer, args.batch_norm, activation_function, args.verbose, args.early_stop)
-    model.train(data.Train_data, data.Validation_data, data.Test_data)
+    if args.dataset == 'ml-tag':
+        model.train(data.Train_data, data.Validation_data, data.Test_data)
+    elif args.dataset == 'company':
+        Train, Valid = {}, {}
+        folds = list(StratifiedKFold(n_splits=2, shuffle=True,
+                                     random_state=2021).split(data.Train_data['X'], data.Train_data['Y']))
+        _get = lambda x, l: [x[i] for i in l]
+        for i, (train_idx, valid_idx) in enumerate(folds):
+            Train['Y'], Train['X'] =  _get(data.Train_data['Y'], train_idx),_get(data.Train_data['X'], train_idx)
+            Valid['Y'], Valid['X'] =  _get(data.Train_data['Y'], valid_idx),_get(data.Train_data['X'], valid_idx)
+            model.train(Train, Valid, data.Test_data)
+
+
     # Find the best validation result across iterations
     best_valid_score = 0
     if args.loss_type == 'square_loss':
